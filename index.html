@@ -616,12 +616,12 @@
 
     <section class="content">
       <div class="status-box info show" id="statusBox">
-        실제 뉴스를 불러오는 중입니다. 이 버전은 API 키 없이 RSS를 사용합니다.
+        실제 뉴스를 불러오는 중입니다. 무료 프록시가 막히면 다른 경로로 자동 재시도합니다.
       </div>
 
       <div class="settings" id="settingsBox">
         <label for="proxyInput">RSS 프록시 주소</label>
-        <input id="proxyInput" placeholder="기본값 사용 권장" />
+        <input id="proxyInput" placeholder="비워두면 자동 프록시 여러 개를 순차 시도" />
         <div class="row">
           <button type="button" id="resetProxyBtn">기본값</button>
           <button type="button" class="primary" id="saveProxyBtn">저장</button>
@@ -687,7 +687,30 @@
     const STORAGE_KEY = "singleHtmlRealNewsReader.v1";
     const PROXY_KEY = "singleHtmlNewsProxy.v1";
 
-    const DEFAULT_PROXY = "https://api.allorigins.win/raw?url=";
+    const DEFAULT_PROXY = "AUTO";
+
+    const PROXY_CANDIDATES = [
+      {
+        name: "AllOrigins Raw",
+        type: "xml",
+        build: url => "https://api.allorigins.win/raw?url=" + encodeURIComponent(url)
+      },
+      {
+        name: "AllOrigins JSON",
+        type: "jsonContents",
+        build: url => "https://api.allorigins.win/get?url=" + encodeURIComponent(url)
+      },
+      {
+        name: "RSS2JSON",
+        type: "rss2json",
+        build: url => "https://api.rss2json.com/v1/api.json?rss_url=" + encodeURIComponent(url)
+      },
+      {
+        name: "CodeTabs",
+        type: "xml",
+        build: url => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(url)
+      }
+    ];
 
     const categories = [
       { id:"all", name:"전체", query:"대한민국 주요 뉴스 OR 국내 뉴스" },
@@ -793,18 +816,57 @@
       return `https://news.google.com/rss/search?q=${encodeURIComponent(fullQuery)}&hl=ko&gl=KR&ceid=KR:ko`;
     }
 
-    async function fetchTextByProxy(url) {
-      const proxy = currentProxy.trim() || DEFAULT_PROXY;
+    async function fetchItemsByProxy(url, category) {
+      const errors = [];
 
-      const response = await fetch(proxy + encodeURIComponent(url), {
-        headers: { "Accept": "application/xml,text/xml,text/plain,*/*" }
-      });
+      const candidates = getProxyCandidates();
 
-      if (!response.ok) {
-        throw new Error(`뉴스 RSS 요청 실패: ${response.status}`);
+      for (const proxy of candidates) {
+        try {
+          const response = await fetch(proxy.build(url), {
+            headers: { "Accept": "application/json,application/xml,text/xml,text/plain,*/*" }
+          });
+
+          if (!response.ok) {
+            throw new Error(`${proxy.name}: ${response.status}`);
+          }
+
+          if (proxy.type === "jsonContents") {
+            const data = await response.json();
+            if (!data.contents) throw new Error(`${proxy.name}: contents 없음`);
+            return parseRss(data.contents, category);
+          }
+
+          if (proxy.type === "rss2json") {
+            const data = await response.json();
+            return parseRss2Json(data, category);
+          }
+
+          const xmlText = await response.text();
+          return parseRss(xmlText, category);
+        } catch (error) {
+          errors.push(error.message);
+        }
       }
 
-      return await response.text();
+      throw new Error("뉴스를 불러오지 못했습니다. 시도한 경로: " + errors.join(" / "));
+    }
+
+    function getProxyCandidates() {
+      const saved = (currentProxy || "").trim();
+
+      if (saved && saved !== "AUTO") {
+        return [
+          {
+            name: "사용자 지정 프록시",
+            type: "xml",
+            build: url => saved + encodeURIComponent(url)
+          },
+          ...PROXY_CANDIDATES
+        ];
+      }
+
+      return PROXY_CANDIDATES;
     }
 
     function parseRss(xmlText, category) {
@@ -835,6 +897,42 @@
           fetchedAt
         };
       }).filter(item => item.title && item.link);
+    }
+
+    function parseRss2Json(data, category) {
+      if (!data || !Array.isArray(data.items)) {
+        throw new Error("RSS2JSON 응답 형식 오류");
+      }
+
+      const fetchedAt = new Date().toISOString();
+
+      return data.items.map(item => {
+        const title = cleanText(item.title || "");
+        const link = cleanText(item.link || "");
+        const source = cleanText(item.author || item.source || extractSourceFromUrl(link) || "뉴스");
+        const publishedAt = item.pubDate ? new Date(item.pubDate).toISOString() : fetchedAt;
+        const summary = makeSummary(item.description || item.content || "", title);
+
+        return {
+          id: makeId(link || title),
+          title: removeSourceFromTitle(title, source),
+          summary,
+          source,
+          category,
+          link,
+          publishedAt,
+          fetchedAt
+        };
+      }).filter(item => item.title && item.link);
+    }
+
+    function extractSourceFromUrl(url) {
+      try {
+        const host = new URL(url).hostname.replace(/^www\./, "");
+        return host || "";
+      } catch (e) {
+        return "";
+      }
     }
 
     function cleanText(value) {
@@ -952,8 +1050,7 @@
         const resultSets = await Promise.all(
           targets.map(async target => {
             const rssUrl = googleNewsRssUrl(target.query);
-            const xmlText = await fetchTextByProxy(rssUrl);
-            return parseRss(xmlText, target.id);
+            return await fetchItemsByProxy(rssUrl, target.id);
           })
         );
 
@@ -966,7 +1063,7 @@
         render();
         showToast(`뉴스 ${items.length}개를 확인했습니다.`);
       } catch (error) {
-        setStatus("error", `${error.message} 프록시가 일시적으로 막혔을 수 있습니다. 잠시 후 다시 시도해 주세요.`);
+        setStatus("error", `${error.message} 무료 RSS 프록시는 사용량·브라우저·네트워크 상태에 따라 막힐 수 있습니다. 업데이트 버튼을 한 번 더 누르거나, 안정적인 사용은 Vercel API 버전을 사용해 주세요.`);
         render();
       } finally {
         isLoading = false;
@@ -1238,19 +1335,19 @@
     }
 
     function setupSettings() {
-      el.proxyInput.value = currentProxy;
+      el.proxyInput.value = currentProxy === "AUTO" ? "" : currentProxy;
 
       el.saveProxyBtn.addEventListener("click", () => {
         const value = el.proxyInput.value.trim();
         currentProxy = value || DEFAULT_PROXY;
         localStorage.setItem(PROXY_KEY, currentProxy);
-        showToast("프록시 주소를 저장했습니다.");
+        showToast(value ? "사용자 지정 프록시를 저장했습니다." : "자동 프록시 모드로 저장했습니다.");
       });
 
       el.resetProxyBtn.addEventListener("click", () => {
         currentProxy = DEFAULT_PROXY;
         localStorage.setItem(PROXY_KEY, currentProxy);
-        el.proxyInput.value = currentProxy;
+        el.proxyInput.value = currentProxy === "AUTO" ? "" : currentProxy;
         showToast("기본 프록시로 되돌렸습니다.");
       });
 
